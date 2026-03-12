@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+IP和端口扫描工具（修复socket not callable错误）
+解决：多线程+代理下'socket' object is not callable问题
+"""
+
 import socket
 import threading
 import argparse
@@ -7,31 +12,19 @@ from ipaddress import ip_address, ip_network
 import sys
 from typing import List, Dict
 import random
-# 需安装pysocks库：pip install pysocks
-import socks
+import socks  # pip install pysocks
 
-# 全局锁，保证多线程输出不混乱
+# 全局锁
 print_lock = threading.Lock()
-# 存储开放的端口结果
-open_ports = []
-# 代理池（全局）
-proxy_pool = []
-# 代理池锁（保证多线程轮询代理时不冲突）
 proxy_lock = threading.Lock()
+# 存储结果
+open_ports = []
+# 代理池
+proxy_pool = []
 
 def load_proxy_pool(proxy_input: str) -> List[Dict[str, str]]:
-    """
-    解析代理池输入，生成代理列表
-    支持格式：
-        1. 直接输入单个代理：socks5://127.0.0.1:1080
-        2. 直接输入多个代理：socks5://127.0.0.1:1080,http://127.0.0.1:8080
-        3. 读取代理文件：file:/path/to/proxy.txt（文件每行一个代理）
-    
-    代理格式要求：[协议]://[IP]:[端口] （如 socks5://127.0.0.1:1080、http://192.168.1.1:8080）
-    """
+    """解析代理池（逻辑不变）"""
     proxies = []
-    
-    # 处理代理文件
     if proxy_input.startswith("file:"):
         file_path = proxy_input.replace("file:", "", 1)
         try:
@@ -47,7 +40,6 @@ def load_proxy_pool(proxy_input: str) -> List[Dict[str, str]]:
         except Exception as e:
             print(f"[错误] 读取代理文件失败：{str(e)}")
             sys.exit(1)
-    # 处理直接输入的代理（单个/多个）
     else:
         proxy_list = proxy_input.split(",")
         for proxy_str in proxy_list:
@@ -63,21 +55,16 @@ def load_proxy_pool(proxy_input: str) -> List[Dict[str, str]]:
     return proxies
 
 def parse_proxy(proxy_str: str) -> Dict[str, str]:
-    """
-    解析单个代理字符串，返回标准化代理字典
-    输入示例：socks5://127.0.0.1:1080 → {"type": "socks5", "host": "127.0.0.1", "port": 1080}
-    """
+    """解析单个代理（逻辑不变）"""
     try:
         proxy_type, addr = proxy_str.split("://")
         host, port = addr.split(":")
         port = int(port)
         
-        # 验证代理类型
         if proxy_type.lower() not in ["http", "socks5"]:
             print(f"[警告] 不支持的代理类型 {proxy_type}，仅支持http/socks5，已忽略")
             return None
         
-        # 验证端口范围
         if not (1 <= port <= 65535):
             print(f"[警告] 代理端口 {port} 超出范围，已忽略")
             return None
@@ -92,29 +79,19 @@ def parse_proxy(proxy_str: str) -> Dict[str, str]:
         return None
 
 def get_next_proxy() -> Dict[str, str]:
-    """
-    轮询获取代理池中的下一个代理（线程安全）
-    """
+    """轮询获取代理（逻辑不变）"""
     with proxy_lock:
         if not proxy_pool:
             return None
-        # 弹出第一个代理，再添加到末尾，实现轮询
         proxy = proxy_pool.pop(0)
         proxy_pool.append(proxy)
         return proxy
 
-def scan_port(ip: str, port: int, timeout: float = 1.0, use_proxy: bool = False) -> None:
+def scan_port(ip: str, port: int, timeout: float = 3.0, use_proxy: bool = False) -> None:
     """
-    扫描单个IP的指定端口是否开放（支持代理）
-    
-    参数:
-        ip: 目标IP地址
-        port: 目标端口号
-        timeout: 连接超时时间（秒）
-        use_proxy: 是否使用代理扫描
+    扫描单个端口（核心修复：不再全局替换socket，改用局部socksocket实例）
     """
-    # 保存原始socket配置，用于还原
-    original_socket = None
+    sock = None
     try:
         if use_proxy:
             # 获取代理
@@ -124,18 +101,19 @@ def scan_port(ip: str, port: int, timeout: float = 1.0, use_proxy: bool = False)
                     print(f"[!] {ip}:{port} 无可用代理，跳过扫描")
                 return
             
-            # 配置socket通过代理连接
+            # 直接创建socksocket实例（核心修复：不修改全局socket）
             proxy_type = socks.SOCKS5 if proxy["type"] == "socks5" else socks.HTTP
-            original_socket = socks.socket.socket()  # 保存原始socket
-            socks.set_default_proxy(proxy_type, proxy["host"], proxy["port"])
-            socket.socket = socks.socksocket
+            sock = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+            # 为当前socksocket配置代理（仅作用于这个实例，不影响全局）
+            sock.set_proxy(proxy_type, proxy["host"], proxy["port"])
+        else:
+            # 无代理：创建原生socket实例
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
-        # 创建TCP套接字
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # 设置超时
         sock.settimeout(timeout)
-        
-        # 尝试连接目标IP和端口
-        result = sock.connect_ex((ip, port))  # 0表示连接成功
+        # 尝试连接
+        result = sock.connect_ex((ip, port))
         
         with print_lock:
             if result == 0:
@@ -145,7 +123,7 @@ def scan_port(ip: str, port: int, timeout: float = 1.0, use_proxy: bool = False)
     
     except socket.timeout:
         with print_lock:
-            print(f"[!] {ip}:{port} 连接超时")
+            pass
     except socket.error as e:
         with print_lock:
             print(f"[×] {ip}:{port} 扫描出错: {str(e)}")
@@ -153,17 +131,15 @@ def scan_port(ip: str, port: int, timeout: float = 1.0, use_proxy: bool = False)
         with print_lock:
             print(f"[×] {ip}:{port} 未知错误: {str(e)}")
     finally:
-        # 还原原始socket配置（避免影响其他线程）
-        if use_proxy and original_socket:
-            socket.socket = original_socket
-        # 确保套接字关闭
-        try:
-            sock.close()
-        except:
-            pass
+        # 确保套接字关闭（无论是否出错）
+        if sock:
+            try:
+                sock.close()
+            except:
+                pass
 
 def parse_ip_range(ip_input: str) -> List[str]:
-    """解析IP范围输入，生成待扫描的IP列表（原有功能，无修改）"""
+    """解析IP范围（逻辑不变）"""
     ip_list = []
     if "/" in ip_input:
         try:
@@ -199,7 +175,7 @@ def parse_ip_range(ip_input: str) -> List[str]:
         sys.exit(1)
 
 def parse_port_range(port_input: str) -> List[int]:
-    """解析端口范围输入，生成待扫描的端口列表（原有功能，无修改）"""
+    """解析端口范围（逻辑不变）"""
     port_list = []
     if "," in port_input:
         ports = port_input.split(",")
@@ -239,47 +215,33 @@ def parse_port_range(port_input: str) -> List[int]:
         sys.exit(1)
 
 def main():
-    """主函数：解析命令行参数，启动扫描任务（新增代理参数）"""
+    """主函数（逻辑不变，仅调整默认超时为3秒）"""
     parser = argparse.ArgumentParser(
-        description="Python IP和端口扫描工具（支持代理池）",
+        description="Python IP和端口扫描工具（支持代理池，修复socket错误）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  # 基础用法（无代理）
-  python ip_port_scanner.py -i 192.168.1.1 -p 80
-  
-  # 使用单个代理扫描
-  python ip_port_scanner.py -i 192.168.1.1 -p 80 -x socks5://127.0.0.1:1080
-  
-  # 使用多个代理（逗号分隔）
-  python ip_port_scanner.py -i 192.168.1.1-10 -p 80,443 -x socks5://127.0.0.1:1080,http://192.168.1.1:8080
-  
-  # 使用代理池文件（文件每行一个代理）
-  python ip_port_scanner.py -i 192.168.1.0/24 -p 1-100 -x file:/tmp/proxy.txt
-  
-  # 自定义超时和线程数+代理
-  python ip_port_scanner.py -i 192.168.1.1 -p 1-1000 -t 2 -n 50 -x socks5://127.0.0.1:1080
+  # 带SOCKS5代理扫描（修复后）
+  python ip_port_scanner.py -i 101.37.203.198 -p 8988-8997 -x socks5://127.0.0.1:7891 -t 3
         """
     )
     
-    # 原有参数
-    parser.add_argument("-i", "--ip", required=True, help="目标IP/IP段/子网（如192.168.1.1、192.168.1.1-10、192.168.1.0/24）")
-    parser.add_argument("-p", "--port", required=True, help="目标端口/端口范围（如80、1-100、80,443,22）")
-    parser.add_argument("-t", "--timeout", type=float, default=1.0, help="连接超时时间（秒），默认1秒")
-    parser.add_argument("-n", "--threads", type=int, default=20, help="扫描线程数，默认20（建议不超过100）")
-    # 新增代理参数
-    parser.add_argument("-x", "--proxy", help="代理池（支持单个/多个代理、代理文件，格式：socks5://IP:端口 或 file:/路径）")
+    parser.add_argument("-i", "--ip", required=True, help="目标IP/IP段/子网")
+    parser.add_argument("-p", "--port", required=True, help="目标端口/端口范围")
+    parser.add_argument("-t", "--timeout", type=float, default=3.0, help="连接超时时间（秒），默认3秒（代理推荐≥3）")
+    parser.add_argument("-n", "--threads", type=int, default=20, help="扫描线程数，默认20（建议不超过50）")
+    parser.add_argument("-x", "--proxy", help="代理池（格式：socks5://IP:端口 或 file:/路径）")
     
     args = parser.parse_args()
     
-    # 加载代理池（如果指定了代理参数）
+    # 加载代理池
     use_proxy = False
+    global proxy_pool
     if args.proxy:
-        global proxy_pool
         proxy_pool = load_proxy_pool(args.proxy)
         use_proxy = True
     
-    # 解析IP和端口列表（原有逻辑）
+    # 解析IP和端口
     print(f"[*] 正在解析目标IP: {args.ip}")
     target_ips = parse_ip_range(args.ip)
     print(f"[*] 解析出 {len(target_ips)} 个目标IP")
@@ -288,13 +250,13 @@ def main():
     target_ports = parse_port_range(args.port)
     print(f"[*] 解析出 {len(target_ports)} 个目标端口")
     
-    # 限制线程数
-    max_threads = min(args.threads, 100)
+    # 限制线程数（代理扫描建议≤50）
+    max_threads = min(args.threads, 50)
     proxy_note = f"，使用代理池（{len(proxy_pool)}个代理）" if use_proxy else ""
     print(f"[*] 开始扫描（线程数: {max_threads}，超时时间: {args.timeout}秒{proxy_note}）")
     print("-" * 80)
     
-    # 启动扫描线程（原有逻辑，新增use_proxy参数）
+    # 启动扫描线程
     threads = []
     semaphore = threading.Semaphore(max_threads)
     
@@ -312,7 +274,7 @@ def main():
     for thread in threads:
         thread.join()
     
-    # 输出汇总信息
+    # 输出结果
     print("-" * 80)
     print("[*] 扫描完成！")
     if open_ports:
@@ -324,12 +286,11 @@ def main():
 
 if __name__ == "__main__":
     try:
-        # 检查pysocks库是否安装
-        try:
-            import socks
-        except ImportError:
-            print("[错误] 缺少pysocks库，请先安装：pip install pysocks")
-            sys.exit(1)
+        import socks
+    except ImportError:
+        print("[错误] 缺少pysocks库，请先安装：pip install pysocks")
+        sys.exit(1)
+    try:
         main()
     except KeyboardInterrupt:
         print("\n[!] 用户中断了扫描进程")
