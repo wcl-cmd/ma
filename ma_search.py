@@ -223,7 +223,7 @@ def main():
         epilog="""
 使用示例:
   # 带SOCKS5代理扫描（修复后）
-  python ip_port_scanner.py -i 101.37.203.198 -p 8988-8997 -x socks5://127.0.0.1:7891 -t 3
+  python ip_port_scanner.py -i ip -p 8988-8997 -x socks5://127.0.0.1:7891 -t 3
         """
     )
     
